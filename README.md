@@ -1,25 +1,46 @@
-# tick2order
+tick2order
+----------
 
-A latency harness for the market-data-to-order path: how long between a tick
-arriving on the wire and the order bytes leaving the machine.
+tick2order measures the latency from a market data tick arriving on the wire to
+the order bytes leaving the machine. It hand-rolls the whole path: TLS and
+WebSocket over raw sockets, an allocation-free JSON scanner, a lock-free SPSC
+ring, and an allocation-free order encoder.
 
-**p50 = 3.71 µs, p99 = 4.86 µs**, over 300K replayed ticks of real OKX
-BTC-USDT-SWAP data on Apple Silicon.
+**p50 3.71 µs, p99 4.86 µs** over 300K replayed ticks of real OKX
+BTC-USDT-SWAP data.
 
-## Where the time goes
+### Documentation quick links
 
-| stage | p50 | share | how |
-|---|---|---|---|
-| JSON parse | 1984 ns | 55% | NEON quote scan, strtod-free float path |
-| `send()` | 1600 ns | 45% | kernel TCP stack, `TCP_NODELAY` |
-| risk check | <41 ns | ~0 | below timer resolution |
-| order encode | <41 ns | ~0 | fixed-decimal formatting, no allocation |
-| WS frame + mask | <41 ns | ~0 | memcpy + XOR |
+* [Building](#building)
+* [Usage](#usage)
+* [Benchmarks](#benchmarks)
+* [What is not measured](#what-is-not-measured)
+* [TECHNICAL_CONCEPTS.md](TECHNICAL_CONCEPTS.md)
 
-Everything hand-written is free — it disappears under the 41 ns timer
-resolution. The whole budget is parsing and one syscall. That is the useful
-result: there is nothing left to micro-optimize in the strategy or encode path,
-and the next real win is `writev`/`sendmmsg` batching or kernel bypass.
+### Building
+
+```
+$ make              # all binaries
+$ make test         # 234 unit tests
+```
+
+macOS or Linux, aarch64 or x86-64. The NEON scan path is aarch64 only and falls
+back to `memchr` elsewhere.
+
+### Usage
+
+```
+$ ./bin/tick2order --replay data/okx_frames.jsonl --iters 300000
+$ ./bin/tick2order --replay data/okx_frames.jsonl --iters 3000 --cadence-us 2000 --warm
+$ ./bin/capture data/my_frames.jsonl --frames 1000 --seconds 60
+```
+
+`capture` is the only tool that touches the network. `data/okx_frames.jsonl`
+already holds 633 real tickers, so replay works out of the box.
+
+### Benchmarks
+
+Apple silicon, 300K iterations replayed from the captured corpus.
 
 ```
 p50     3,712 ns
@@ -28,11 +49,26 @@ p99.9   8,192 ns
 max    13,084 ns
 ```
 
-## Cache warming
+Where it goes:
+
+| stage | p50 | share |
+|---|---|---|
+| JSON parse | 1984 ns | 55% |
+| `send()` syscall | 1600 ns | 45% |
+| risk check | <41 ns | ~0 |
+| order encode | <41 ns | ~0 |
+| WS frame + mask | <41 ns | ~0 |
+
+Everything hand-written falls below the 41 ns timer resolution. The entire
+budget is JSON parsing and one syscall, which means there is nothing left to
+win in the strategy or encode path and the next real step is `writev`/
+`sendmmsg` batching, or kernel bypass on Linux.
+
+#### Cache warming
 
 OKX pushes about 6 messages/sec, so between ticks the i-cache, d-cache and
-branch predictors all go cold. Running the identical code path unmeasured
-against a throwaway sink during the idle gap recovers it:
+branch predictors go cold. Running the identical code path unmeasured against a
+throwaway sink during the idle gap recovers it:
 
 | scenario | p50 | p99 |
 |---|---|---|
@@ -40,77 +76,51 @@ against a throwaway sink during the idle gap recovers it:
 | 2 ms idle gap, no warming | 7936 ns | 10240 ns |
 | 2 ms idle gap, warming | 3584 ns | 4608 ns |
 
-This also explained an earlier live-OKX measurement of 8.7 µs that had been
-written off as network noise. It was cold cache, and it reproduces
-deterministically.
+This also explained an earlier live measurement of 8.7 µs that had been written
+off as network noise. It was cold cache, and it reproduces on demand.
 
-Warming is not free: it costs the extreme tail (p99.9 and max) because the CPU
-never idles. A production system would tune the warming cadence against that
-trade-off rather than leaving it on.
+Warming costs the extreme tail, p99.9 and max, because the CPU never idles.
+Production would tune the cadence against that rather than leaving it on.
+Technique from arXiv 2309.04259, A/B tested here rather than assumed.
 
-Technique from arXiv 2309.04259, A/B-tested here rather than assumed.
+### What is not measured
 
-## What is and isn't measured
-
-Orders terminate at a loopback TCP sink, not at OKX. So the number covers JSON
-parse, order encode, WebSocket framing and the `send()` syscall — all real — and
-excludes TLS encryption on the order socket (~1–2 µs) and the ~13 ms of wire
+Orders terminate at a loopback TCP sink, not at OKX. The number covers JSON
+parse, order encode, WebSocket framing and `send()`. It excludes TLS
+encryption on the order socket, worth roughly 1-2 µs, and the ~13 ms of wire
 flight to the exchange.
 
-Real order submission needs credentials and capital. This measures how fast the
-local execution stack runs, which is the part that's actually under your
-control.
+Real order submission needs credentials and capital. This measures the local
+execution stack, which is the part under your control.
 
-## Capture once, replay forever
+This is not a trading strategy and not a live trading system. There are no
+signals, no PnL, no position tracking, no order cancellation and no crash
+recovery.
+
+### Why replay
 
 Benchmarking against a live venue is close to useless: the sample count changes
-every run and market noise swamps whatever you just optimized. So frames are
-captured once and replayed deterministically.
+every run and market noise swamps whatever you just changed. Frames are
+captured once and replayed deterministically, so the same input gives the same
+number and an optimization shows up as a delta.
 
-```bash
-./bin/capture data/my_frames.jsonl --frames 1000 --seconds 60
-./bin/tick2order --replay data/okx_frames.jsonl --iters 300000
-```
+### Design notes
 
-`data/okx_frames.jsonl` already holds 633 real BTC-USDT-SWAP tickers. Same
-input, same number every time, so an optimization shows up as a delta instead
-of noise.
+RapidJSON allocates and builds a tree, and only 5 known fields per message are
+needed, so the scanner reads in place with no allocation on the hot path. The
+cost is that it is schema-specific and does no validation, which is acceptable
+for fixed venue messages with tests behind them.
 
-## Build and run
+`strtod` consults the locale on every call. For the bounded numeric tokens an
+exchange sends, a mantissa-in-`uint64_t` fast path is faster and still
+correctly rounded; it defers to `strtod` for tokens over 19 digits or |exp| >
+22.
 
-```bash
-make                # all binaries
-make test           # 234 unit tests
+`affinity.hpp` pins threads and calls `mlockall` to cut scheduler jitter. That
+is enforced on Linux. On macOS the affinity API is advisory and the code says
+so rather than pretending otherwise.
 
-./bin/tick2order --replay data/okx_frames.jsonl --iters 300000
-./bin/tick2order --replay data/okx_frames.jsonl --iters 3000 --cadence-us 2000 --warm
-```
-
-## Design notes
-
-**Allocation-free JSON scan instead of a library.** RapidJSON allocates and
-builds a tree; only 5 known fields per message are needed. Scanning in place
-costs nothing on the hot path and has no malloc jitter. The price is that it's
-schema-specific and does no validation — fine for fixed venue messages with
-tests behind them.
-
-**NEON quote scan, memchr fallback.** Finding the next `"` is the inner loop.
-On aarch64 a 16-byte NEON compare beats a byte loop; elsewhere it falls back to
-memchr, which libc has already vectorized.
-
-**Hand-rolled float parser.** `strtod` consults the locale on every call. For
-the bounded numeric tokens an exchange sends, a mantissa-in-`uint64_t` fast
-path is faster and still correctly rounded. It defers to `strtod` for the rare
-pathological token (>19 digits, or |exp| > 22).
-
-**Thread pinning and `mlockall`.** `affinity.hpp` pins threads to eliminate
-scheduler jitter. Enforced on Linux; on macOS the API is advisory and the code
-says so rather than pretending otherwise.
-
-**Fixed-bucket histogram.** O(1) record, correct tail percentiles over millions
-of samples.
-
-## Layout
+### Layout
 
 ```
 cpp/include/
@@ -125,20 +135,9 @@ cpp/include/
 
 cpp/src/
   tick2order_main.cpp   the benchmark
-  capture_main.cpp      frame capture (the only tool that touches the network)
+  capture_main.cpp      frame capture
 
 cpp/tests/
   test_all.cpp     81 tests: JSON, risk, venue routing
   test_infra.cpp   153 tests: SPSC ring, clock, WebSocket, venue parsers
 ```
-
-## Scope
-
-Not a strategy — no signals, no PnL, no hedging. Not a live trading system — no
-real order submission, no position tracking, no cancellation or crash recovery.
-It's a measurement tool for the execution path.
-
-## References
-
-- arXiv 2309.04259 — C++ design patterns for low-latency applications
-- RFC 6455 — the WebSocket protocol
