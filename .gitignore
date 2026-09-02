@@ -1,0 +1,6 @@
+bin/
+build/
+*.o
+__pycache__/
+*.pyc
+.DS_Store
